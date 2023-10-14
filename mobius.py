@@ -1,15 +1,18 @@
 import copy
+
+from matplotlib import pyplot as plt
 from svgpathtools import svg2paths
 import numpy as np
 np.set_printoptions(suppress=True)
 import os
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 import pygame
+from scipy.interpolate import interp1d
 from playsound import playsound
 from functools import partial
 
 # Save the animation? TODO: Make sure you're saving to correct destination!!
-save_anim = True
+save_anim = False
 
 # Pygame + gameloop setup
 width = 800
@@ -34,9 +37,9 @@ def A_many(vals):
 
 
 # 3D Camera parameters (rho = distance from origin, phi = angle from world's +z-axis, theta=angle from world's +x-axis)
-rho, theta, phi = 1000., -np.pi/2, 0  # Rho is the distance from world origin to near clipping plane
+rho, theta, phi = 150., -np.pi/2, 0  # Rho is the distance from world origin to near clipping plane
 v_rho, v_theta, v_phi = 0, 0, 0
-focus = 1000000.  # Distance from near clipping plane to eye
+focus = 900.  # Distance from near clipping plane to eye TODO: Change back
 
 
 # Normal perspective project
@@ -84,11 +87,14 @@ def world_to_plane_many(pts):
 
 # Keyframe / timing params
 FPS = 60
-t = 0
+t = 9.0
 dt = 0.01    # i.e., 1 frame corresponds to +0.01 in parameter space = 0.01 * FPS = +0.6 per second (assuming 60 FPS)
 
 keys = [0,      # Keyframe 0. Straight line move
-        4.]
+        4.,     # Keyframe 1. Shift eye position + flip over + reveal Mobius strip
+        9.,     # Keyframe 2. Rotate around it + Traveler's journey
+        12.,    # Keyframe 3. Reset back to original position.
+        13.]
 
 # keys.extend([keys[-1] + 10, keys[-1] + (10 * 2)])  # Placeholder + done
 
@@ -126,10 +132,11 @@ def slash(t_, new_start=0.0, new_end=0.5):
     return (t_ - new_start) / (new_end - new_start)
 
 
-def rot_mat(radians):
-    M = np.array([[np.cos(radians), -np.sin(radians), 0],
-                  [np.sin(radians), np.cos(radians), 0],
-                  [0, 0, 1]])
+# 3D rotation matrix about z-axis
+def rotmat(radians):
+    M = np.array([[np.cos(radians), 0, np.sin(radians)],
+                  [0, 1, 0],
+                  [-np.sin(radians), 0, np.cos(radians)]])
     return M
 
 
@@ -187,9 +194,53 @@ def circle3d(u, radius, center_x=0, center_y=0, center_z=0):
 
 def Scurve3d(u, startpt, endpt, steepness=1.0):
     '''
-        Returns an S shaped curve in 3D connecting the two points, in the xy-plane
+        Returns an S shaped curve in 3D connecting the two points, parallel to the xy-plane
     '''
-    return np.array([lerp(ease_inout2(u, beta=steepness), startpt[0], endpt[0]), lerp(u, startpt[1], endpt[1]), 0.])
+    return np.array([lerp(ease_inout2(u, beta=steepness), startpt[0], endpt[0]), lerp(u, startpt[1], endpt[1]), startpt[2]])
+
+
+# 2D curve containing shape of the mobius strip (without twist)
+def C(t_):
+    t_ = 2 * np.pi * np.asarray(t_)
+    u = t_ / (2 * np.pi)
+    h = 100 * (0.5 * u ** 2 - 1.5 * u ** 3 + 1.5 * u ** 4 - 0.5 * u ** 5)
+    h += 100 * (0.5 * u ** 3 - u ** 4 + 0.5 * u ** 5)
+    h1 = 0.32 * h
+    return np.array([np.cbrt(np.sin(t_)), -h1])
+
+
+# Returns a FUNCTION you can sample from [0, 1] which returns equally spaced points for equally spaced inputs.
+def get_parameterization(xscale, yscale, N=1000):
+    t_values = np.linspace(0, 1, N + 1)  # t in [0, 1]
+    segment_lengths = np.sqrt(np.sum(np.diff(C(t_values), axis=1) ** 2, axis=0))
+    S = np.sum(segment_lengths)
+    normalized_cumulative_lengths = np.concatenate(([0], np.cumsum(segment_lengths))) / S
+
+    x_interp = interp1d(normalized_cumulative_lengths, C(t_values)[0, :], kind='linear')
+    y_interp = interp1d(normalized_cumulative_lengths, C(t_values)[1, :], kind='linear')
+
+    def get_point(s):
+        # Ensure s is in [0, 1]
+        s = np.clip(s, 0, 0.9999)
+        return np.array([xscale * x_interp(s), yscale * y_interp(s)])
+
+    return get_point
+
+
+def mobius_angle(tau, tau_start, tau_end, sharpness=4.0):
+    '''
+        Given a curve parameter value tau, we output the angle about the curve skeleton.
+        For tau <= tau_start and tau >= tau_end, the angle is clamped to 0 and 180 degrees,
+        respectively, and otherwise it's smoothly interpolated between 0 and 180 degrees.
+
+        The sharpness controls how localized / spread-out the twist is.
+    '''
+    if tau <= tau_start:
+        return 0
+    elif tau >= tau_end:
+        return np.pi
+
+    return ease_inout2((tau - tau_start) / (tau_end - tau_start), beta=sharpness) * np.pi
 
 
 # Shape sampling functions
@@ -208,6 +259,18 @@ def get_Scurve3d_pts(u, startpt, endpt, steepness=1.0, du=0.001):
     pts = []
     for u_ in np.arange(0, u + du, du):
         pts.append(Scurve3d(u_, startpt, endpt, steepness=steepness))
+    return pts
+
+
+def get_mobius_pt(u, mobius_2d, z=0, x=0):
+    yz = mobius_2d(u)
+    return np.array([x, yz[0], yz[1] + z])
+
+
+def get_mobius3d_pts(u, mobius_2d, z=0, x=0, du=0.001):
+    pts = []
+    for u_ in np.arange(0, u + du, du):
+        pts.append(get_mobius_pt(u_, mobius_2d, z, x))
     return pts
 
 
@@ -325,9 +388,12 @@ def main():
     straight_length = y_sampling_interval * np.round(straight_length / y_sampling_interval)  # make a multiple of interval
     strip_width = x_sampling_interval * np.round(strip_width / x_sampling_interval)  # make a multiple of interval
 
+    # Get mobius strip skeleton curve sampling function (preprocess once with high precision)
+    mobius_length, mobius_height = straight_length/2.1 / 2, straight_length/2.5 / 2
+    mobius = get_parameterization(xscale=mobius_length, yscale=mobius_height, N=500)
+
     # Parameters for the traveler guy
     radius = 100.
-    blink_times = [0.1, 0.5, 0.6, 0.8]
     eye_params = {
         'ypos': 0.6,  # center of eyeball +n% of the way BODY
         'width': radius * 0.4,
@@ -348,27 +414,79 @@ def main():
         # Keyframe 0 — Straight Line Move
         if frame == 0:
             yOffset = -ease_out(slash(u, 0.2, 1.0)) * straight_length
+            zOffset = 0.
 
             # Draw 1 cycle of "fake" straight-line strip. It starts at y=0 (so that Mobius strip ends up
             # being centered at the origin; remember the starting of this "fake" strip = middle of the straight-line
             # portion of the Mobius strip.) TODO: Extend the strip to be > 1 cycle (for "infinite" feel.)
             # (a) Horizontal lines
             xleft, xright = -strip_width / 2., +strip_width / 2.
-            for y in np.arange(0, straight_length + y_sampling_interval, y_sampling_interval):
-                leftPt, rightPt = world_to_plane(np.array([xleft, y+yOffset, 0])), world_to_plane(np.array([xright, y+yOffset, 0]))
+            for y in np.arange(-6 * y_sampling_interval, straight_length + (7 * y_sampling_interval), y_sampling_interval):
+                leftPt, rightPt = world_to_plane(np.array([xleft, y+yOffset, zOffset])), world_to_plane(np.array([xright, y+yOffset, zOffset]))
                 pygame.draw.line(window, colors['white'], *A_many([leftPt, rightPt]), width=2)
             # (b) Vertical Lines
             for x in np.arange(xleft, xright + x_sampling_interval, x_sampling_interval):
-                botPt, topPt = world_to_plane(np.array([x, yOffset, 0])), world_to_plane(np.array([x, straight_length+yOffset, 0]))
+                botPt, topPt = world_to_plane(np.array([x, -6 * y_sampling_interval + yOffset, zOffset])), world_to_plane(np.array([x, straight_length + (6 * y_sampling_interval) + yOffset, zOffset]))
                 pygame.draw.line(window, colors['white'], *A_many([botPt, topPt]), width=2)
+
+
+            # # ********
+            # # TEMPORARY MOBIUS STRIP TESTING
+            # # ********
+            #
+            # # Plot the skeleton curve
+            # pts = world_to_plane_many(get_mobius3d_pts(1, mobius, z=zOffset, x=0, du=0.01))
+            # pygame.draw.polygon(window, colors['white'], A_many(pts), 2)
+            # # Plot the horizontal lines of the mobius strip mesh (on the non-ground region)
+            # tau_start = 0.13
+            # tau_end = 1 - tau_start
+            # tau_spacing = 0.017
+            # sharpness = 4.0  # of the twist
+            # for tau in np.arange(tau_start, tau_end + tau_spacing, tau_spacing):
+            #     sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+            #     rad = strip_width / 2
+            #     mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+            #     pt_right = world_to_plane(mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)]))
+            #     pt_left = world_to_plane(mob_pt - np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)]))
+            #     pygame.draw.line(window, colors['white'], *A_many([pt_left, pt_right]), width=2)
+            #
+            # # Plot the rest of the horizontal lines TODO
+            # xleft, xright = -strip_width / 2., +strip_width / 2.
+            # n_intervals = 6  # number of extra horizontal lines on each side of the ending
+            # y_near, y_far = straight_length - (n_intervals * y_sampling_interval), straight_length + (n_intervals * y_sampling_interval)
+            # for y in np.arange(y_near, y_far + y_sampling_interval, y_sampling_interval):
+            #     yoff = y + yOffset
+            #     leftPt, rightPt = world_to_plane(np.array([xleft, yoff, zOffset])), world_to_plane(np.array([xright, yoff, zOffset]))
+            #     pygame.draw.line(window, colors['white'], *A_many([leftPt, rightPt]), width=2)
+            #
+            # # Plot the vertical lines of the mobius strip mesh
+            # xleft, xright = -strip_width / 2., +strip_width / 2.
+            # for rad in np.arange(xleft, xright + x_sampling_interval, x_sampling_interval):
+            #     pts = []
+            #     for tau in np.arange(0, 1 + tau_spacing, tau_spacing):
+            #         sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+            #         mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+            #         line_pt = mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])
+            #         pts.append(line_pt)
+            #     pts = world_to_plane_many(pts)
+            #     pygame.draw.lines(window, colors['white'], False, A_many(pts), width=2)  # NOTE: It won't be a closed loop!
+            #
+            #
+            #
+            # # ********
+            # # TEMPORARY MOBIUS STRIP TESTING
+            # # ********
+
+
+
 
             # Draw the red / blue wires (just for effect of following along)
             for k in range(2):
                 mult = -1 if k==1 else 1
                 col = colors['blue'] if k==1 else colors['red']
-                startpt, endpt = np.array([mult * -strip_width / 4., 0., 0.]), np.array([mult * strip_width / 4., straight_length, 0.])
+                startpt, endpt = np.array([mult * -strip_width / 4., -1000, zOffset]), np.array([mult * strip_width / 4., straight_length + 1000, zOffset])
                 startpt[1] += yOffset; endpt[1] += yOffset
-                pts = world_to_plane_many(get_Scurve3d_pts(1, startpt, endpt, steepness=2.0, du=0.001))
+                pts = world_to_plane_many(get_Scurve3d_pts(1, startpt, endpt, steepness=4.0, du=0.001))
                 pygame.draw.lines(window, col, False, A_many(pts), width=30)
                 pygame.draw.lines(window, lerp(0.3, col, colors['white']), False, A_many(pts), width=10)
 
@@ -379,10 +497,10 @@ def main():
                 yoff = y + yOffset
                 for i, leftX in enumerate([xleft, 0]):
                     halfwidth = strip_width / 2.
-                    topright = world_to_plane(np.array([leftX + halfwidth, boxheight / 2. + yoff, 0]))
-                    topleft = world_to_plane(np.array([leftX, boxheight / 2. + yoff, 0]))
-                    botleft = world_to_plane(np.array([leftX, -boxheight / 2. + yoff, 0]))
-                    botright = world_to_plane(np.array([leftX + halfwidth, -boxheight / 2. + yoff, 0]))
+                    topright = world_to_plane(np.array([leftX + halfwidth, boxheight / 2. + yoff, zOffset]))
+                    topleft = world_to_plane(np.array([leftX, boxheight / 2. + yoff, zOffset]))
+                    botleft = world_to_plane(np.array([leftX, -boxheight / 2. + yoff, zOffset]))
+                    botright = world_to_plane(np.array([leftX + halfwidth, -boxheight / 2. + yoff, zOffset]))
                     pygame.draw.polygon(window, cols[i], A_many([topright, topleft, botleft, botright]), 0)
                     pygame.draw.polygon(window, colors['white'], A_many([topright, topleft, botleft, botright]), 2)
                 cols[0], cols[1] = cols[1], cols[0]
@@ -408,7 +526,7 @@ def main():
                         normalized_y = -(point.imag - avg_y) / (max_y - min_y)
                         points[i] = world_to_plane(np.array([mult * ((normalized_x * scale[0]) - strip_width / 2.7 + (j * spacing)),
                                                              yoff + normalized_y * scale[1] + (0.5 * boxheight / 2),
-                                                             0.0]))
+                                                             zOffset]))
                     # Draw the path
                     if len(points) > 1:
                         pygame.draw.polygon(window, colors['START'], A_many(points))  # Fill the shape
@@ -417,14 +535,15 @@ def main():
             amp, n_cycles = 10, 5
             xOffset = amp * np.sin(2 * np.pi * slash(u, 0.2, 1.0) * n_cycles) * np.sin(np.pi * slash(u, 0.2, 1.0))
             # (a) Draw main body
-            traveler_pos = np.array([xOffset, -boxheight/2 + radius*1.3, 0.])
-            pts = get_circle3d_pts(1.0, radius, *traveler_pos, du=0.01)
+            traveler_pos = np.array([xOffset, -boxheight/2 + radius*1.3, zOffset])
+            # pts = get_circle3d_pts(1.0, radius, *traveler_pos, du=0.01)   # TODO: Why is this gray?
             start_col, end_col = lerp(0.6, colors['red'], colors['fullred']), lerp(0.6, colors['blue'], colors['fullblue'])
             for ptop, pbot, col in get_gradient_circle3d(radius, *traveler_pos, start_col, end_col, sharpness=2.0):
                 pygame.draw.line(window, col, *A_many([world_to_plane(ptop), world_to_plane(pbot)]), width=3)
             # pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 5)
             # ***
             # For blinking
+            blink_times = [0.1, 0.5, 0.6, 0.8]
             blink_mult = sum([blink_bump(u, p) for p in blink_times])
             eye_height = lerp(blink_mult, eye_params['height'], 0.0)
             iris_height = lerp(blink_mult, eye_params['iris_height'], 0.0)
@@ -440,9 +559,590 @@ def main():
             pts = get_ellipse3d_pts(1.0, eye_params['iris_width'], iris_height, *iris_pos, du=0.01)
             pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 0)
 
+        # Keyframe 1 — Flip over "fake" strip
+        elif frame == 1:
+            # u = 0
+            u_prime, seg = squash(u, [0.0, 0.1, 0.2, 1.0])  # (1) Blink + move down, (2) Open, (3) Flip
+            show_mobius = seg == 2 and u > 0.66
+            if seg in {0, 1}:
+                u_prime = ease_out(u_prime)
+
+            angleOffset = lerp(u_prime, 0., np.pi) if seg == 2 else 0.
+            M = rotmat(angleOffset)
+
+            # f0, f1 = 100000., 5000.
+            # focus = f0 * np.power(f1 / f0, min(1.0, 2.0 * slash(u, new_end=0.7)))
+            rho0, rho1 = 150., 2600.
+            rho = lerp(slash(ease_inout(u_prime), new_start=0.98, new_end=1.0), rho0, rho1) if seg == 2 else 150
+            rho_tau = (rho - rho0) / (rho1 - rho0)
+
+            # TODO: UNBLOCK!
+            phi = lerp(u_prime, 0, np.pi / 4) if seg == 2 else 0
+            theta = lerp(slash(u_prime, new_start=0.0, new_end=0.6), -np.pi/2, -np.pi/6) if seg == 2 else -np.pi/2
+
+            yOffset = -straight_length
+            zOffset = lerp(u_prime, 0., mobius_height * 0.2) if seg ==2 else 0.
+
+            # Draw 1 cycle of "fake" straight-line strip. It starts at y=0 (so that Mobius strip ends up
+            # being centered at the origin; remember the starting of this "fake" strip = middle of the straight-line
+            # portion of the Mobius strip.)
+            if not show_mobius:
+                # (a) Horizontal lines
+                xleft, xright = -strip_width / 2., +strip_width / 2.
+                for y in np.arange(-6 * y_sampling_interval + straight_length, straight_length + (11 * y_sampling_interval),
+                                   y_sampling_interval):
+                    leftPt, rightPt = np.array([xleft, y + yOffset, zOffset]), np.array([xright, y + yOffset, zOffset])
+                    leftPt, rightPt = world_to_plane(M @ leftPt), world_to_plane(M @ rightPt)
+                    pygame.draw.line(window, colors['white'], *A_many([leftPt, rightPt]), width=2)
+                # (b) Vertical Lines
+                for x in np.arange(xleft, xright + x_sampling_interval, x_sampling_interval):
+                    botPt, topPt = world_to_plane(
+                        M @ np.array([x, straight_length + -6 * y_sampling_interval + yOffset, zOffset])), world_to_plane(
+                        M @ np.array([x, straight_length + (11 * y_sampling_interval) + yOffset, zOffset]))
+                    pygame.draw.line(window, colors['white'], *A_many([botPt, topPt]), width=2)
+
+            # ********
+            # TEMPORARY MOBIUS STRIP TESTING
+            # ********
+
+            # Plot the skeleton curve
+            tau_start = 0.11
+            tau_end = 1 - tau_start
+            tau_spacing = 0.011
+            sharpness = 4.0  # of the twist
+            if show_mobius:
+                pts = get_mobius3d_pts(1, mobius, z=zOffset, x=0, du=0.01)
+                pts = [world_to_plane(M @ pt) for pt in pts]
+                pygame.draw.polygon(window, colors['white'], A_many(pts), 2)
+                # Plot the horizontal lines of the mobius strip mesh (on the non-ground region)
+                for tau in np.arange(tau_start, tau_end + tau_spacing, tau_spacing):
+                    sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                    rad = strip_width / 2
+                    mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                    pt_right = world_to_plane(M @ (mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])))
+                    pt_left = world_to_plane(M @ (mob_pt - np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])))
+                    pygame.draw.line(window, colors['white'], *A_many([pt_left, pt_right]), width=2)
+
+                # Plot the vertical lines of the mobius strip mesh
+                xleft, xright = -strip_width / 2., +strip_width / 2.
+                for rad in np.arange(xleft, xright + x_sampling_interval, x_sampling_interval):
+                    pts = []
+                    for tau in np.arange(0, 1 + tau_spacing, tau_spacing):
+                        sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                        mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                        line_pt = mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])
+                        pts.append(M @ line_pt)
+                    pts = world_to_plane_many(pts)
+                    pygame.draw.lines(window, colors['white'], False, A_many(pts),
+                                      width=2)  # NOTE: It won't be a closed loop!
+
+            # Plot the rest of the horizontal lines TODO
+            xleft, xright = -strip_width / 2., +strip_width / 2.
+            n_intervals = 8  # number of extra horizontal lines on each side of the ending
+            y_near, y_far = straight_length - (n_intervals * y_sampling_interval), straight_length + (
+                        n_intervals * y_sampling_interval)
+            for y in np.arange(y_near, y_far + y_sampling_interval, y_sampling_interval):
+                yoff = y + yOffset
+                leftPt, rightPt = world_to_plane(M @ np.array([xleft, yoff, zOffset])), world_to_plane(
+                    M @ np.array([xright, yoff, zOffset]))
+                pygame.draw.line(window, colors['white'], *A_many([leftPt, rightPt]), width=2)
+
+            # ********
+            # TEMPORARY MOBIUS STRIP TESTING
+            # ********
+
+            # Draw the red / blue wires (just for effect of following along)
+            # But let's draw them directly on the Mobius strip right now.
+            if show_mobius:
+                x_starts = [-strip_width / 4., +strip_width / 4.]
+                for j, start_rad in enumerate(x_starts):
+                    pts = []
+                    col = colors['red'] if j == 1 else colors['blue']
+                    for tau in np.arange(0, 1 + tau_spacing, tau_spacing):
+                        rad = lerp(ease_inout2(tau, beta=4.0), start_rad, x_starts[(j + 1) % 2])
+                        sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                        mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                        line_pt = mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])
+                        pts.append(M @ line_pt)
+                    pts = world_to_plane_many(pts)
+                    line_width = lerp(rho_tau, 30., 10.)
+                    pygame.draw.lines(window, col, False, A_many(pts), width=int(line_width))
+                    line_width = lerp(rho_tau, 10., 3.)
+                    pygame.draw.lines(window, lerp(0.3, col, colors['white']), False, A_many(pts), width=int(line_width))
+            else:
+                for k in range(2):
+                    mult = -1 if k == 1 else 1
+                    col = colors['red'] if k == 1 else colors['blue']
+                    startpt, endpt = np.array([mult * -strip_width / 4., straight_length - 1000, zOffset]), np.array([-mult * strip_width / 4., straight_length + 1000, zOffset])
+                    startpt[1] += yOffset; endpt[1] += yOffset
+                    pts = get_Scurve3d_pts(1, startpt, endpt, steepness=2.0, du=0.001)
+                    pts = world_to_plane_many([M @ pt for pt in pts])
+                    pygame.draw.lines(window, col, False, A_many(pts), width=30)
+                    pygame.draw.lines(window, lerp(0.3, col, colors['white']), False, A_many(pts), width=10)
+
+            # Draw the red + blue boxes for starting line (TODO: Draw it again for the ending of the strip)
+            boxheight = y_sampling_interval * 6.
+            cols = [colors['blue'], colors['red']]
+            for y in [straight_length]:
+                yoff = y + yOffset
+                for i, leftX in enumerate([xleft, 0]):
+                    halfwidth = strip_width / 2.
+                    topright = world_to_plane(M @ np.array([leftX + halfwidth, boxheight / 2. + yoff, zOffset]))
+                    topleft = world_to_plane(M @ np.array([leftX, boxheight / 2. + yoff, zOffset]))
+                    botleft = world_to_plane(M @ np.array([leftX, -boxheight / 2. + yoff, zOffset]))
+                    botright = world_to_plane(M @ np.array([leftX + halfwidth, -boxheight / 2. + yoff, zOffset]))
+                    pygame.draw.polygon(window, cols[i], A_many([topright, topleft, botleft, botright]), 0)
+                    pygame.draw.polygon(window, colors['white'], A_many([topright, topleft, botleft, botright]), 2)
+                cols[0], cols[1] = cols[1], cols[0]
+
+            # Draw "START" Text via SVG
+            scale = [width * 0.13, width * 0.2]
+            spacing = 113
+            for k in [1]:
+                yoff = yOffset + (straight_length if k == 1 else 0)
+                mult = -1 if k == 1 else 1
+
+                for j, char in enumerate('START'):
+                    path = STAR_paths[char]
+                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 50)]
+
+                    # Renormalize coordinates
+                    min_x, max_x = min(point.real for point in points), max(point.real for point in points)
+                    avg_x = (min_x + max_x) / 2.
+                    min_y, max_y = min(point.imag for point in points), max(point.imag for point in points)
+                    avg_y = (min_y + max_y) / 2.
+                    for i, point in enumerate(points):
+                        normalized_x = (point.real - avg_x) / (max_x - min_x)
+                        normalized_y = -(point.imag - avg_y) / (max_y - min_y)
+                        points[i] = world_to_plane(
+                            M @ np.array([mult * ((normalized_x * scale[0]) - strip_width / 2.7 + (j * spacing)),
+                                      yoff + normalized_y * scale[1] + (0.5 * boxheight / 2),
+                                      zOffset]))
+                    # Draw the path
+                    if len(points) > 1:
+                        pygame.draw.polygon(window, colors['START'], A_many(points))  # Fill the shape
+
+            # Draw the traveler
+            xOffset = 0
+            # (a) Draw main body
+            traveler_pos = np.array([xOffset, -boxheight / 2 + radius * 1.3, zOffset])
+            # pts = get_circle3d_pts(1.0, radius, *traveler_pos, du=0.01)   # TODO: Why is this gray?
+            start_col, end_col = lerp(0.6, colors['red'], colors['fullred']), lerp(0.6, colors['blue'],
+                                                                                   colors['fullblue'])
+            for ptop, pbot, col in get_gradient_circle3d(radius, *traveler_pos, start_col, end_col, sharpness=2.0):
+                pygame.draw.line(window, col, *A_many([world_to_plane(M @ ptop), world_to_plane(M @ pbot)]), width=3)
+            # pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 5)
+            # ***
+
+            # For eye-shifting (final values)
+            # For reference (old):
+            # eye_params = {
+            #     'ypos': 0.6,  # center of eyeball +n% of the way BODY
+            #     'width': radius * 0.4,
+            #     'height': radius * 0.35,
+            #     'iris_pos': 0.35,  # center of iris +n% of the way EYEBALL
+            #     'iris_width': radius * 0.25,
+            #     'iris_height': radius * 0.25
+            # }
+
+            # Intermediary values
+            eye_ypos_int, eye_width_int, eye_height_int = 0.45, radius * 0.4, 0
+            iris_pos_int, iris_width_int, iris_height_int = 0, radius * 0.25, 0
+            # Final values
+            eye_ypos, eye_width, eye_height = 0.3, radius * 0.4, radius * 0.35
+            iris_pos_, iris_width, iris_height = 0, radius * 0.25, radius * 0.25
+            if seg == 0:
+                eye_ypos = lerp(u_prime, eye_params['ypos'], eye_ypos_int)
+                eye_width = lerp(u_prime, eye_params['width'], eye_width_int)
+                eye_height = lerp(u_prime, eye_params['height'], eye_height_int)
+                iris_pos_ = lerp(u_prime, eye_params['iris_pos'], iris_pos_int)
+                iris_width = lerp(u_prime, eye_params['iris_width'], iris_width_int)
+                iris_height = lerp(u_prime, eye_params['iris_height'], iris_height_int)
+            elif seg == 1:
+                eye_ypos = lerp(u_prime, eye_ypos_int, eye_ypos)
+                eye_width = lerp(u_prime, eye_width_int, eye_width)
+                eye_height = lerp(u_prime, eye_height_int, eye_height)
+                iris_pos_ = lerp(u_prime, iris_pos_int, iris_pos_)
+                iris_width = lerp(u_prime, iris_width_int, iris_width)
+                iris_height = lerp(u_prime, iris_height_int, iris_height)
+
+            # ***
+            # (b) Draw white eyeball
+            eyeball_pos = traveler_pos + np.array([0., eye_ypos * radius, 0.])
+            pts = get_ellipse3d_pts(1.0, eye_width, eye_height, *eyeball_pos, du=0.01)
+            pts = [M @ pt for pt in pts]
+            pygame.draw.polygon(window, colors['white'], A_many(world_to_plane_many(pts)), 0)
+            pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 3)
+            # (c) Draw black iris
+            iris_pos = eyeball_pos + np.array([0., iris_pos_ * eye_height, 0.])
+            pts = get_ellipse3d_pts(1.0, iris_width, iris_height, *iris_pos, du=0.01)
+            pts = [M @ pt for pt in pts]
+            pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 0)
+
+        # Keyframe 2 — Rotate + Traveler's journey
+        elif frame == 2:
+            # u = 0
+            u_prime, seg = squash(u, [0.0, 0.3, 1.0])  # (1) Rotate around, (2) Journey
+            show_mobius = True
+
+            angleOffset = np.pi
+            M = rotmat(angleOffset)
+
+            # f0, f1 = 100000., 5000.
+            # focus = f0 * np.power(f1 / f0, min(1.0, 2.0 * slash(u, new_end=0.7)))
+            rho = 2600
+
+            phi = np.pi / 4
+            if seg == 0:
+                theta = lerp(ease_out(u_prime), -np.pi / 6, -np.pi / 6 + 1.4 * np.pi)
+
+            yOffset = -straight_length
+            zOffset = mobius_height * 0.2
+
+            # Draw 1 cycle of "fake" straight-line strip. It starts at y=0 (so that Mobius strip ends up
+            # being centered at the origin; remember the starting of this "fake" strip = middle of the straight-line
+            # portion of the Mobius strip.)
+            # if not show_mobius:
+            #     # (a) Horizontal lines
+            #     xleft, xright = -strip_width / 2., +strip_width / 2.
+            #     for y in np.arange(-6 * y_sampling_interval + straight_length,
+            #                        straight_length + (11 * y_sampling_interval),
+            #                        y_sampling_interval):
+            #         leftPt, rightPt = np.array([xleft, y + yOffset, zOffset]), np.array([xright, y + yOffset, zOffset])
+            #         leftPt, rightPt = world_to_plane(M @ leftPt), world_to_plane(M @ rightPt)
+            #         pygame.draw.line(window, colors['white'], *A_many([leftPt, rightPt]), width=2)
+            #     # (b) Vertical Lines
+            #     for x in np.arange(xleft, xright + x_sampling_interval, x_sampling_interval):
+            #         botPt, topPt = world_to_plane(
+            #             M @ np.array(
+            #                 [x, straight_length + -6 * y_sampling_interval + yOffset, zOffset])), world_to_plane(
+            #             M @ np.array([x, straight_length + (11 * y_sampling_interval) + yOffset, zOffset]))
+            #         pygame.draw.line(window, colors['white'], *A_many([botPt, topPt]), width=2)
+
+            # ********
+            # TEMPORARY MOBIUS STRIP TESTING
+            # ********
+
+            tau_start = 0.11
+            tau_end = 1 - tau_start
+            tau_spacing = 0.011
+            sharpness = 4.0  # of the twist
+
+            # Plot the skeleton curve
+            if show_mobius:
+                pts = get_mobius3d_pts(1, mobius, z=zOffset, x=0, du=0.01)
+                pts = [world_to_plane(M @ pt) for pt in pts]
+                pygame.draw.polygon(window, colors['white'], A_many(pts), 2)
+                # Plot the horizontal lines of the mobius strip mesh (on the non-ground region)
+                for tau in np.arange(tau_start, tau_end + tau_spacing, tau_spacing):
+                    sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                    rad = strip_width / 2
+                    mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                    pt_right = world_to_plane(M @ (mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])))
+                    pt_left = world_to_plane(M @ (mob_pt - np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])))
+                    pygame.draw.line(window, colors['white'], *A_many([pt_left, pt_right]), width=2)
+
+                # Plot the vertical lines of the mobius strip mesh
+                xleft, xright = -strip_width / 2., +strip_width / 2.
+                for rad in np.arange(xleft, xright + x_sampling_interval, x_sampling_interval):
+                    pts = []
+                    for tau in np.arange(0, 1 + tau_spacing, tau_spacing):
+                        sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                        mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                        line_pt = mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])
+                        pts.append(M @ line_pt)
+                    pts = world_to_plane_many(pts)
+                    pygame.draw.lines(window, colors['white'], False, A_many(pts),
+                                      width=2)  # NOTE: It won't be a closed loop!
+
+            # Plot the rest of the horizontal lines TODO
+            xleft, xright = -strip_width / 2., +strip_width / 2.
+            n_intervals = 8  # number of extra horizontal lines on each side of the ending
+            y_near, y_far = straight_length - (n_intervals * y_sampling_interval), straight_length + (
+                    n_intervals * y_sampling_interval)
+            for y in np.arange(y_near, y_far + y_sampling_interval, y_sampling_interval):
+                yoff = y + yOffset
+                leftPt, rightPt = world_to_plane(M @ np.array([xleft, yoff, zOffset])), world_to_plane(
+                    M @ np.array([xright, yoff, zOffset]))
+                pygame.draw.line(window, colors['white'], *A_many([leftPt, rightPt]), width=2)
+
+            # ********
+            # TEMPORARY MOBIUS STRIP TESTING
+            # ********
+
+            # Draw the red / blue wires (just for effect of following along)
+            x_starts = [-strip_width / 4., +strip_width / 4.]
+            for j, start_rad in enumerate(x_starts):
+                pts = []
+                col = colors['red'] if j == 1 else colors['blue']
+                for tau in np.arange(0, 1 + tau_spacing, tau_spacing):
+                    rad = lerp(ease_inout2(tau, beta=4.0, center=0.4), start_rad, x_starts[(j + 1) % 2])
+                    sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                    mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                    line_pt = mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])
+                    pts.append(M @ line_pt)
+                pts = world_to_plane_many(pts)
+                line_width = lerp(1, 30., 10.)
+                pygame.draw.lines(window, col, False, A_many(pts), width=int(line_width))
+                line_width = lerp(1, 10., 3.)
+                pygame.draw.lines(window, lerp(0.3, col, colors['white']), False, A_many(pts), width=int(line_width))
+
+            # Draw the red + blue boxes for starting line (TODO: Draw it again for the ending of the strip)
+            boxheight = y_sampling_interval * 6.
+            cols = [colors['blue'], colors['red']]
+            for y in [straight_length]:
+                yoff = y + yOffset
+                for i, leftX in enumerate([xleft, 0]):
+                    halfwidth = strip_width / 2.
+                    topright = world_to_plane(M @ np.array([leftX + halfwidth, boxheight / 2. + yoff, zOffset]))
+                    topleft = world_to_plane(M @ np.array([leftX, boxheight / 2. + yoff, zOffset]))
+                    botleft = world_to_plane(M @ np.array([leftX, -boxheight / 2. + yoff, zOffset]))
+                    botright = world_to_plane(M @ np.array([leftX + halfwidth, -boxheight / 2. + yoff, zOffset]))
+                    pygame.draw.polygon(window, cols[i], A_many([topright, topleft, botleft, botright]), 0)
+                    pygame.draw.polygon(window, colors['white'], A_many([topright, topleft, botleft, botright]), 2)
+                cols[0], cols[1] = cols[1], cols[0]
+
+            # Draw "START" Text via SVG
+            scale = [width * 0.13, width * 0.2]
+            spacing = 113
+            for k in [1]:
+                yoff = yOffset + (straight_length if k == 1 else 0)
+                mult = -1 if k == 1 else 1
+
+                for j, char in enumerate('START'):
+                    path = STAR_paths[char]
+                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 50)]
+
+                    # Renormalize coordinates
+                    min_x, max_x = min(point.real for point in points), max(point.real for point in points)
+                    avg_x = (min_x + max_x) / 2.
+                    min_y, max_y = min(point.imag for point in points), max(point.imag for point in points)
+                    avg_y = (min_y + max_y) / 2.
+                    for i, point in enumerate(points):
+                        normalized_x = (point.real - avg_x) / (max_x - min_x)
+                        normalized_y = -(point.imag - avg_y) / (max_y - min_y)
+                        points[i] = world_to_plane(
+                            M @ np.array([mult * ((normalized_x * scale[0]) - strip_width / 2.7 + (j * spacing)),
+                                          yoff + normalized_y * scale[1] + (0.5 * boxheight / 2),
+                                          zOffset]))
+                    # Draw the path
+                    if len(points) > 1:
+                        pygame.draw.polygon(window, colors['START'], A_many(points))  # Fill the shape
+
+            # Draw the traveler
+            xOffset = 0
+            # (a) Draw main body (accounting for journey)
+            traveler_pos = np.array([xOffset, -boxheight / 2 + radius * 1.3, zOffset])
+            if seg == 1:
+                traveler_pos = get_mobius_pt(u_prime, mobius, z=zOffset, x=0)
+
+            # pts = get_circle3d_pts(1.0, radius, *traveler_pos, du=0.01)
+            start_col, end_col = lerp(0.6, colors['red'], colors['fullred']), lerp(0.6, colors['blue'],
+                                                                                   colors['fullblue'])
+            for ptop, pbot, col in get_gradient_circle3d(radius, *traveler_pos, start_col, end_col, sharpness=2.0):
+                pygame.draw.line(window, col, *A_many([world_to_plane(M @ ptop), world_to_plane(M @ pbot)]), width=3)
+            # pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 5)
+            # ***
+
+            # Final values
+            eye_ypos, eye_width, eye_height = 0.3, radius * 0.4, radius * 0.35
+            iris_pos_, iris_width, iris_height = 0, radius * 0.25, radius * 0.25
+
+            # ***
+            # (b) Draw white eyeball
+            eyeball_pos = traveler_pos + np.array([0., eye_ypos * radius, 0.])
+            pts = get_ellipse3d_pts(1.0, eye_width, eye_height, *eyeball_pos, du=0.01)
+            pts = [M @ pt for pt in pts]
+            pygame.draw.polygon(window, colors['white'], A_many(world_to_plane_many(pts)), 0)
+            pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 3)
+            # (c) Draw black iris
+            iris_pos = eyeball_pos + np.array([0., iris_pos_ * eye_height, 0.])
+            pts = get_ellipse3d_pts(1.0, iris_width, iris_height, *iris_pos, du=0.01)
+            pts = [M @ pt for pt in pts]
+            pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 0)
+
+        # Keyframe 3 — Reset back TODO (Optional. If it's too hard, just zoom in, MAKE HIM BLINK, and call it a day.)
+        elif frame == 3:
+            u = slash(u, new_start=0., new_end=0.9)
+            show_mobius = True
+
+            angleOffset = np.pi
+            M = rotmat(angleOffset)
+
+            # if u == 0.:
+            #     rho = 2600.
+            #     theta = -np.pi / 6 + 1.3 * np.pi
+            #     phi = np.pi / 4
+
+            rho = lerp(slash(u, new_start=0., new_end=0.3), 2600, 150)
+            theta = lerp(u, -np.pi / 6 + 1.3 * np.pi, 1.5 * np.pi)
+            phi = lerp(u, np.pi / 4, 0.)
+
+            cull_top = rho < 260.
+
+            yOffset = -straight_length
+            zOffset = lerp(u, mobius_height * 0.2, 0.)# TODO UNBLOCK
+
+            # Draw 1 cycle of "fake" straight-line strip. It starts at y=0 (so that Mobius strip ends up
+            # being centered at the origin; remember the starting of this "fake" strip = middle of the straight-line
+            # portion of the Mobius strip.)
+            # if not show_mobius:
+            #     # (a) Horizontal lines
+            #     xleft, xright = -strip_width / 2., +strip_width / 2.
+            #     for y in np.arange(-6 * y_sampling_interval + straight_length,
+            #                        straight_length + (11 * y_sampling_interval),
+            #                        y_sampling_interval):
+            #         leftPt, rightPt = np.array([xleft, y + yOffset, zOffset]), np.array([xright, y + yOffset, zOffset])
+            #         leftPt, rightPt = world_to_plane(M @ leftPt), world_to_plane(M @ rightPt)
+            #         pygame.draw.line(window, colors['white'], *A_many([leftPt, rightPt]), width=2)
+            #     # (b) Vertical Lines
+            #     for x in np.arange(xleft, xright + x_sampling_interval, x_sampling_interval):
+            #         botPt, topPt = world_to_plane(
+            #             M @ np.array(
+            #                 [x, straight_length + -6 * y_sampling_interval + yOffset, zOffset])), world_to_plane(
+            #             M @ np.array([x, straight_length + (11 * y_sampling_interval) + yOffset, zOffset]))
+            #         pygame.draw.line(window, colors['white'], *A_many([botPt, topPt]), width=2)
+
+            # ********
+            # TEMPORARY MOBIUS STRIP TESTING
+            # ********
+
+            tau_start = 0.11
+            tau_end = 1 - tau_start
+            tau_spacing = 0.011
+            sharpness = 4.0  # of the twist
+
+            # Plot the skeleton curve
+            if show_mobius:
+                pts = get_mobius3d_pts(1, mobius, z=zOffset, x=0, du=0.01)
+                pts = [world_to_plane(M @ pt) for pt in pts]
+                pygame.draw.polygon(window, colors['white'], A_many(pts), 2)
+                # Plot the horizontal lines of the mobius strip mesh (on the non-ground region)
+                for tau in np.arange(tau_start, tau_end + tau_spacing, tau_spacing):
+                    if not cull_top or (tau < 0.3 or tau > 1-0.3):
+                        sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                        rad = strip_width / 2
+                        mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                        pt_right = world_to_plane(M @ (mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])))
+                        pt_left = world_to_plane(M @ (mob_pt - np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])))
+                        pygame.draw.line(window, colors['white'], *A_many([pt_left, pt_right]), width=2)
+
+                # Plot the vertical lines of the mobius strip mesh
+                xleft, xright = -strip_width / 2., +strip_width / 2.
+                for rad in np.arange(xleft, xright + x_sampling_interval, x_sampling_interval):
+                    pts = []
+                    for tau in np.arange(0, (0.3 if cull_top else 1) + tau_spacing, tau_spacing):  # TODO
+                        sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                        mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                        line_pt = mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])
+                        pts.append(M @ line_pt)
+                    pts = world_to_plane_many(pts)
+                    pygame.draw.lines(window, colors['white'], False, A_many(pts),
+                                      width=2)  # NOTE: It won't be a closed loop!
+
+            # Plot the rest of the horizontal lines TODO
+            xleft, xright = -strip_width / 2., +strip_width / 2.
+            n_intervals = 8  # number of extra horizontal lines on each side of the ending
+            y_near, y_far = straight_length - (n_intervals * y_sampling_interval), straight_length + (
+                    n_intervals * y_sampling_interval)
+            for y in np.arange(y_near, y_far + y_sampling_interval, y_sampling_interval):
+                yoff = y + yOffset
+                leftPt, rightPt = world_to_plane(M @ np.array([xleft, yoff, zOffset])), world_to_plane(
+                    M @ np.array([xright, yoff, zOffset]))
+                pygame.draw.line(window, colors['white'], *A_many([leftPt, rightPt]), width=2)
+
+            # ********
+            # TEMPORARY MOBIUS STRIP TESTING
+            # ********
+
+            # Draw the red / blue wires (just for effect of following along)
+            if False:  # seg != 2:
+                for k in range(2):
+                    mult = -1 if k == 1 else 1
+                    col = colors['blue'] if k == 1 else colors['red']
+                    startpt, endpt = np.array([mult * -strip_width / 4., 0., zOffset]), np.array(
+                        [mult * strip_width / 4., straight_length, zOffset])
+                    startpt[1] += yOffset;
+                    endpt[1] += yOffset
+                    pts = get_Scurve3d_pts(1, startpt, endpt, steepness=2.0, du=0.001)
+                    pts = world_to_plane_many([M @ pt for pt in pts])
+                    pygame.draw.lines(window, col, False, A_many(pts), width=30)
+                    pygame.draw.lines(window, lerp(0.3, col, colors['white']), False, A_many(pts), width=10)
+
+            # Draw the red + blue boxes for starting line (TODO: Draw it again for the ending of the strip)
+            boxheight = y_sampling_interval * 6.
+            cols = [colors['blue'], colors['red']]
+            for y in [straight_length]:
+                yoff = y + yOffset
+                for i, leftX in enumerate([xleft, 0]):
+                    halfwidth = strip_width / 2.
+                    topright = world_to_plane(M @ np.array([leftX + halfwidth, boxheight / 2. + yoff, zOffset]))
+                    topleft = world_to_plane(M @ np.array([leftX, boxheight / 2. + yoff, zOffset]))
+                    botleft = world_to_plane(M @ np.array([leftX, -boxheight / 2. + yoff, zOffset]))
+                    botright = world_to_plane(M @ np.array([leftX + halfwidth, -boxheight / 2. + yoff, zOffset]))
+                    pygame.draw.polygon(window, cols[i], A_many([topright, topleft, botleft, botright]), 0)
+                    pygame.draw.polygon(window, colors['white'], A_many([topright, topleft, botleft, botright]), 2)
+                cols[0], cols[1] = cols[1], cols[0]
+
+            # Draw "START" Text via SVG
+            scale = [width * 0.13, width * 0.2]
+            spacing = 113
+            for k in [1]:
+                yoff = yOffset + (straight_length if k == 1 else 0)
+                mult = -1 if k == 1 else 1
+
+                for j, char in enumerate('START'):
+                    path = STAR_paths[char]
+                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 50)]
+
+                    # Renormalize coordinates
+                    min_x, max_x = min(point.real for point in points), max(point.real for point in points)
+                    avg_x = (min_x + max_x) / 2.
+                    min_y, max_y = min(point.imag for point in points), max(point.imag for point in points)
+                    avg_y = (min_y + max_y) / 2.
+                    for i, point in enumerate(points):
+                        normalized_x = (point.real - avg_x) / (max_x - min_x)
+                        normalized_y = -(point.imag - avg_y) / (max_y - min_y)
+                        points[i] = world_to_plane(
+                            M @ np.array([mult * ((normalized_x * scale[0]) - strip_width / 2.7 + (j * spacing)),
+                                          yoff + normalized_y * scale[1] + (0.5 * boxheight / 2),
+                                          zOffset]))
+                    # Draw the path
+                    if len(points) > 1:
+                        pygame.draw.polygon(window, colors['START'], A_many(points))  # Fill the shape
+
+            # Draw the traveler
+            xOffset = 0
+            # (a) Draw main body
+            traveler_pos = np.array([xOffset, -boxheight / 2 + radius * 1.3, zOffset])
+            # pts = get_circle3d_pts(1.0, radius, *traveler_pos, du=0.01)
+            start_col, end_col = lerp(0.6, colors['red'], colors['fullred']), lerp(0.6, colors['blue'],
+                                                                                   colors['fullblue'])
+            for ptop, pbot, col in get_gradient_circle3d(radius, *traveler_pos, start_col, end_col, sharpness=2.0):
+                pygame.draw.line(window, col, *A_many([world_to_plane(M @ ptop), world_to_plane(M @ pbot)]), width=3)
+            # pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 5)
+            # ***
+
+            # Final values
+            eye_ypos, eye_width, eye_height = 0.3, radius * 0.4, radius * 0.35
+            iris_pos_, iris_width, iris_height = 0, radius * 0.25, radius * 0.25
+
+            # ***
+            # (b) Draw white eyeball
+            eyeball_pos = traveler_pos + np.array([0., eye_ypos * radius, 0.])
+            pts = get_ellipse3d_pts(1.0, eye_width, eye_height, *eyeball_pos, du=0.01)
+            pts = [M @ pt for pt in pts]
+            pygame.draw.polygon(window, colors['white'], A_many(world_to_plane_many(pts)), 0)
+            pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 3)
+            # (c) Draw black iris
+            iris_pos = eyeball_pos + np.array([0., iris_pos_ * eye_height, 0.])
+            pts = get_ellipse3d_pts(1.0, iris_width, iris_height, *iris_pos, du=0.01)
+            pts = [M @ pt for pt in pts]
+            pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 0)
 
 
-
+        else:
+            print('done')
 
 
         # We handle keys pressed inside the gameloop in PyGame
