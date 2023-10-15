@@ -12,7 +12,7 @@ from playsound import playsound
 from functools import partial
 
 # Save the animation? TODO: Make sure you're saving to correct destination!!
-save_anim = False
+save_anim = True
 
 # Pygame + gameloop setup
 width = 800
@@ -87,14 +87,14 @@ def world_to_plane_many(pts):
 
 # Keyframe / timing params
 FPS = 60
-t = 9.0
+t = 0.0
 dt = 0.01    # i.e., 1 frame corresponds to +0.01 in parameter space = 0.01 * FPS = +0.6 per second (assuming 60 FPS)
 
 keys = [0,      # Keyframe 0. Straight line move
         4.,     # Keyframe 1. Shift eye position + flip over + reveal Mobius strip
         9.,     # Keyframe 2. Rotate around it + Traveler's journey
-        12.,    # Keyframe 3. Reset back to original position.
-        13.]
+        12.+2.,    # Keyframe 3. Reset back to original position.
+        15.+2.]
 
 # keys.extend([keys[-1] + 10, keys[-1] + (10 * 2)])  # Placeholder + done
 
@@ -177,12 +177,12 @@ def line(u, start, fin):
     return ((1 - u) * start) + (u * fin)
 
 
-def ellipse3d(u, width_, height_, center_x=0, center_y=0, center_z=0):
+def ellipse3d(u, width_, height_, center_x=0, center_y=0, center_z=0, align_mat=np.eye(3)):
     '''
         Parametric ellipse in 3D, parallel to the xy-plane (ground).
     '''
     tau = 2 * np.pi * u
-    return np.array([width_ * np.cos(tau), height_ * np.sin(tau), 0.]) + np.array([center_x, center_y, center_z])
+    return (align_mat @ np.array([width_ * np.cos(tau), height_ * np.sin(tau), 0.])) + np.array([center_x, center_y, center_z])
 
 
 def circle3d(u, radius, center_x=0, center_y=0, center_z=0):
@@ -196,7 +196,7 @@ def Scurve3d(u, startpt, endpt, steepness=1.0):
     '''
         Returns an S shaped curve in 3D connecting the two points, parallel to the xy-plane
     '''
-    return np.array([lerp(ease_inout2(u, beta=steepness), startpt[0], endpt[0]), lerp(u, startpt[1], endpt[1]), startpt[2]])
+    return np.array([lerp(ease_inout2(u, beta=steepness, center=0.4), startpt[0], endpt[0]), lerp(u, startpt[1], endpt[1]), startpt[2]])
 
 
 # 2D curve containing shape of the mobius strip (without twist)
@@ -244,10 +244,10 @@ def mobius_angle(tau, tau_start, tau_end, sharpness=4.0):
 
 
 # Shape sampling functions
-def get_ellipse3d_pts(u, width_, height_, center_x, center_y, center_z, du=0.001):
+def get_ellipse3d_pts(u, width_, height_, center_x, center_y, center_z, align_mat=np.eye(3), du=0.001):
     pts = []
     for u_ in np.arange(0, u + du, du):
-        pts.append(ellipse3d(u_, width_, height_, center_x, center_y, center_z))
+        pts.append(ellipse3d(u_, width_, height_, center_x, center_y, center_z, align_mat=align_mat))
     return pts
 
 
@@ -275,7 +275,7 @@ def get_mobius3d_pts(u, mobius_2d, z=0, x=0, du=0.001):
 
 
 # TODO: Implement for circles not necessarily aligned with the xy-plane.
-def get_gradient_circle3d(radius, center_x, center_y, center_z, start_col, end_col, sharpness=5.0):
+def get_gradient_circle3d(radius, center_x, center_y, center_z, start_col, end_col, align_mat=None, sharpness=5.0):
     '''
         'sharpness': How sharp the gradient is.
 
@@ -286,11 +286,15 @@ def get_gradient_circle3d(radius, center_x, center_y, center_z, start_col, end_c
     '''
 
     center_x, center_y, center_z, radius = int(center_x), int(center_y), int(center_z), int(radius)
-    for x in range(center_x - radius, center_x + radius + 1, 1):
+    for x in range(-radius, radius + 1, 1):
         u_ = (x + radius) / (2 * radius)
         u_ = ease_inout2(u_, beta=sharpness)
-        sqrt = np.sqrt(np.power(radius, 2.0) - np.power(x - center_x, 2.0))
-        ptop, pbot = np.array([x, center_y + sqrt, center_z]), np.array([x, center_y - sqrt, center_z])
+        sqrt = np.sqrt(np.power(radius, 2.0) - np.power(x, 2.0))
+        ptop, pbot = np.array([x, +sqrt, 0.]), np.array([x, -sqrt, 0.])
+        if align_mat is not None:
+            ptop, pbot = align_mat @ ptop, align_mat @ pbot
+        center = np.array([center_x, center_y, center_z])
+        ptop += center; pbot += center
         yield ptop, pbot, lerp(u_, start_col, end_col)
 
 
@@ -514,7 +518,7 @@ def main():
 
                 for j, char in enumerate('START'):
                     path = STAR_paths[char]
-                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 50)]
+                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 500)]
 
                     # Renormalize coordinates
                     min_x, max_x = min(point.real for point in points), max(point.real for point in points)
@@ -659,7 +663,7 @@ def main():
                     pts = []
                     col = colors['red'] if j == 1 else colors['blue']
                     for tau in np.arange(0, 1 + tau_spacing, tau_spacing):
-                        rad = lerp(ease_inout2(tau, beta=4.0), start_rad, x_starts[(j + 1) % 2])
+                        rad = lerp(ease_inout2(tau, beta=4.0, center=0.4), start_rad, x_starts[(j + 1) % 2])
                         sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
                         mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
                         line_pt = mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])
@@ -704,7 +708,7 @@ def main():
 
                 for j, char in enumerate('START'):
                     path = STAR_paths[char]
-                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 50)]
+                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 500)]
 
                     # Renormalize coordinates
                     min_x, max_x = min(point.real for point in points), max(point.real for point in points)
@@ -782,7 +786,8 @@ def main():
         # Keyframe 2 — Rotate + Traveler's journey
         elif frame == 2:
             # u = 0
-            u_prime, seg = squash(u, [0.0, 0.3, 1.0])  # (1) Rotate around, (2) Journey
+            # u = ease_inout(u)
+            u_prime, seg = squash(u, [0.0, 0.4, 1.0])  # (1) Rotate around, (2) Journey
             show_mobius = True
 
             angleOffset = np.pi
@@ -794,7 +799,9 @@ def main():
 
             phi = np.pi / 4
             if seg == 0:
-                theta = lerp(ease_out(u_prime), -np.pi / 6, -np.pi / 6 + 1.4 * np.pi)
+                theta = lerp(ease_inout(u_prime), -np.pi / 6, -np.pi / 6 + 1.4 * np.pi)
+            elif seg == 1:
+                theta = lerp(ease_inout(u_prime), -np.pi / 6 + 1.4 * np.pi, -np.pi / 6 + 1.45 * np.pi)
 
             yOffset = -straight_length
             zOffset = mobius_height * 0.2
@@ -911,7 +918,7 @@ def main():
 
                 for j, char in enumerate('START'):
                     path = STAR_paths[char]
-                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 50)]
+                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 500)]
 
                     # Renormalize coordinates
                     min_x, max_x = min(point.real for point in points), max(point.real for point in points)
@@ -933,14 +940,28 @@ def main():
             xOffset = 0
             # (a) Draw main body (accounting for journey)
             traveler_pos = np.array([xOffset, -boxheight / 2 + radius * 1.3, zOffset])
+            tangent, forward, normal = None, None, None  # columns of transformation matrix
+            journey_mat = np.eye(3)  # transformation mat
+            djourney = 0.0001
             if seg == 1:
-                traveler_pos = get_mobius_pt(u_prime, mobius, z=zOffset, x=0)
+                d_uprime = 0.02
+                traveler_pos = get_mobius_pt((u_prime - d_uprime) % 1.0, mobius, z=zOffset, x=0)
+                forward_pos = get_mobius_pt((u_prime - d_uprime + djourney) % 1.0, mobius, z=zOffset, x=0)
+                forward = forward_pos - traveler_pos
+                forward /= np.linalg.norm(forward)
+
+                angle = mobius_angle(u_prime - d_uprime, tau_start=0.0, tau_end=1.0, sharpness=sharpness)
+                tangent = np.array([np.cos(angle), 0., np.sin(angle)])  # will be unit length: cos^2 + sin^2
+                normal = np.cross(tangent, forward)
+                journey_mat = np.column_stack((tangent, forward, normal))
 
             # pts = get_circle3d_pts(1.0, radius, *traveler_pos, du=0.01)
-            start_col, end_col = lerp(0.6, colors['red'], colors['fullred']), lerp(0.6, colors['blue'],
-                                                                                   colors['fullblue'])
-            for ptop, pbot, col in get_gradient_circle3d(radius, *traveler_pos, start_col, end_col, sharpness=2.0):
-                pygame.draw.line(window, col, *A_many([world_to_plane(M @ ptop), world_to_plane(M @ pbot)]), width=3)
+            c1, c2 = lerp(0.6, colors['red'], colors['fullred']), lerp(0.6, colors['blue'], colors['fullblue'])
+            fake = seg == 1 and u_prime > 0.9 and u < 0.9
+            start_col, end_col = c1 if not fake else c2, c2 if not fake else c1
+            for ptop, pbot, col in get_gradient_circle3d(radius, *traveler_pos, start_col, end_col, align_mat=journey_mat, sharpness=2.0):
+                pygame.draw.line(window, col, *A_many([world_to_plane(M @ ptop),
+                                                       world_to_plane(M @ pbot)]), width=3)
             # pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 5)
             # ***
 
@@ -950,14 +971,14 @@ def main():
 
             # ***
             # (b) Draw white eyeball
-            eyeball_pos = traveler_pos + np.array([0., eye_ypos * radius, 0.])
-            pts = get_ellipse3d_pts(1.0, eye_width, eye_height, *eyeball_pos, du=0.01)
+            eyeball_pos = traveler_pos + (journey_mat @ np.array([0., eye_ypos * radius, 0.]))
+            pts = get_ellipse3d_pts(1.0, eye_width, eye_height, *eyeball_pos, align_mat=journey_mat, du=0.01)
             pts = [M @ pt for pt in pts]
             pygame.draw.polygon(window, colors['white'], A_many(world_to_plane_many(pts)), 0)
             pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 3)
             # (c) Draw black iris
             iris_pos = eyeball_pos + np.array([0., iris_pos_ * eye_height, 0.])
-            pts = get_ellipse3d_pts(1.0, iris_width, iris_height, *iris_pos, du=0.01)
+            pts = get_ellipse3d_pts(1.0, iris_width, iris_height, *iris_pos, align_mat=journey_mat, du=0.01)
             pts = [M @ pt for pt in pts]
             pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 0)
 
@@ -974,14 +995,14 @@ def main():
             #     theta = -np.pi / 6 + 1.3 * np.pi
             #     phi = np.pi / 4
 
-            rho = lerp(slash(u, new_start=0., new_end=0.3), 2600, 150)
-            theta = lerp(u, -np.pi / 6 + 1.3 * np.pi, 1.5 * np.pi)
-            phi = lerp(u, np.pi / 4, 0.)
+            rho = lerp(ease_inout(slash(u, new_start=0., new_end=0.3)), 2600, 1000)
+            theta = lerp(0, -np.pi / 6 + 1.45 * np.pi, 1.5 * np.pi)
+            phi = lerp(0, np.pi / 4, 0.)
 
             cull_top = rho < 260.
 
             yOffset = -straight_length
-            zOffset = lerp(u, mobius_height * 0.2, 0.)# TODO UNBLOCK
+            zOffset = lerp(0, mobius_height * 0.2, 0.)# TODO UNBLOCK
 
             # Draw 1 cycle of "fake" straight-line strip. It starts at y=0 (so that Mobius strip ends up
             # being centered at the origin; remember the starting of this "fake" strip = middle of the straight-line
@@ -1056,18 +1077,21 @@ def main():
             # ********
 
             # Draw the red / blue wires (just for effect of following along)
-            if False:  # seg != 2:
-                for k in range(2):
-                    mult = -1 if k == 1 else 1
-                    col = colors['blue'] if k == 1 else colors['red']
-                    startpt, endpt = np.array([mult * -strip_width / 4., 0., zOffset]), np.array(
-                        [mult * strip_width / 4., straight_length, zOffset])
-                    startpt[1] += yOffset;
-                    endpt[1] += yOffset
-                    pts = get_Scurve3d_pts(1, startpt, endpt, steepness=2.0, du=0.001)
-                    pts = world_to_plane_many([M @ pt for pt in pts])
-                    pygame.draw.lines(window, col, False, A_many(pts), width=30)
-                    pygame.draw.lines(window, lerp(0.3, col, colors['white']), False, A_many(pts), width=10)
+            x_starts = [-strip_width / 4., +strip_width / 4.]
+            for j, start_rad in enumerate(x_starts):
+                pts = []
+                col = colors['red'] if j == 1 else colors['blue']
+                for tau in np.arange(0, 1 + tau_spacing, tau_spacing):
+                    rad = lerp(ease_inout2(tau, beta=4.0, center=0.4), start_rad, x_starts[(j + 1) % 2])
+                    sigma = mobius_angle(tau, tau_start, tau_end, sharpness=sharpness)
+                    mob_pt = get_mobius_pt(tau, mobius, z=zOffset, x=0)
+                    line_pt = mob_pt + np.array([rad * np.cos(sigma), 0, rad * np.sin(sigma)])
+                    pts.append(M @ line_pt)
+                pts = world_to_plane_many(pts)
+                line_width = lerp(1, 30., 10.)
+                pygame.draw.lines(window, col, False, A_many(pts), width=int(line_width))
+                line_width = lerp(1, 10., 3.)
+                pygame.draw.lines(window, lerp(0.3, col, colors['white']), False, A_many(pts), width=int(line_width))
 
             # Draw the red + blue boxes for starting line (TODO: Draw it again for the ending of the strip)
             boxheight = y_sampling_interval * 6.
@@ -1093,7 +1117,7 @@ def main():
 
                 for j, char in enumerate('START'):
                     path = STAR_paths[char]
-                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 50)]
+                    points = [path.point(t).conjugate() for t in np.linspace(0, 1, 500)]
 
                     # Renormalize coordinates
                     min_x, max_x = min(point.real for point in points), max(point.real for point in points)
@@ -1118,14 +1142,21 @@ def main():
             # pts = get_circle3d_pts(1.0, radius, *traveler_pos, du=0.01)
             start_col, end_col = lerp(0.6, colors['red'], colors['fullred']), lerp(0.6, colors['blue'],
                                                                                    colors['fullblue'])
+            start_col, end_col = end_col, start_col
             for ptop, pbot, col in get_gradient_circle3d(radius, *traveler_pos, start_col, end_col, sharpness=2.0):
                 pygame.draw.line(window, col, *A_many([world_to_plane(M @ ptop), world_to_plane(M @ pbot)]), width=3)
             # pygame.draw.polygon(window, colors['black'], A_many(world_to_plane_many(pts)), 5)
             # ***
 
             # Final values
-            eye_ypos, eye_width, eye_height = 0.3, radius * 0.4, radius * 0.35
-            iris_pos_, iris_width, iris_height = 0, radius * 0.25, radius * 0.25
+            eye_ypos, eye_width, eye_params['height'] = 0.3, radius * 0.4, radius * 0.35
+            iris_pos_, iris_width, eye_params['iris_height'] = 0, radius * 0.25, radius * 0.25
+
+            # For blinking
+            blink_times = [0.4, 0.5]
+            blink_mult = sum([blink_bump(u, p) for p in blink_times])
+            eye_height = lerp(blink_mult, eye_params['height'], 0.0)
+            iris_height = lerp(blink_mult, eye_params['iris_height'], 0.0)
 
             # ***
             # (b) Draw white eyeball
